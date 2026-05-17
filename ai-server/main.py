@@ -1,10 +1,11 @@
 import os
+import json
 from pathlib import Path
-import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from groq import AsyncGroq
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env")
@@ -20,8 +21,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GROK_API_KEY = os.getenv("GROK_API_KEY")
-GROK_API_URL = "https://api.x.ai/v1/chat/completions"
+GROQ_API_KEY = (
+    os.getenv("GROQ_API_KEY")
+    or os.getenv("GROK_API_KEY")
+    or os.getenv("GROK_APIP_KEY")
+)
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 AI_SERVER_PORT = int(os.getenv("AI_SERVER_PORT", os.getenv("PORT", "8000")))
 
 class TextRequest(BaseModel):
@@ -34,33 +39,23 @@ class SummaryResponse(BaseModel):
     suggestedTitle: str
     tokensUsed: int
 
-async def call_grok_api(prompt: str) -> dict:
-    """Call Grok API with the given prompt"""
-    if not GROK_API_KEY:
-        raise HTTPException(status_code=500, detail="GROK_API_KEY not configured")
-    
-    headers = {
-        "Authorization": f"Bearer {GROK_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    
-    payload = {
-        "model": "grok-beta",
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.7,
-        "max_tokens": 1024,
-    }
-    
+async def call_groq_api(prompt: str) -> tuple[str, int]:
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY not configured")
+
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(GROK_API_URL, json=payload, headers=headers, timeout=30.0)
-            response.raise_for_status()
-            result = response.json()
-            return result
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=500, detail=f"Grok API error: {str(e)}")
+        client = AsyncGroq(api_key=GROQ_API_KEY)
+        response = await client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_completion_tokens=1024,
+        )
+        content = response.choices[0].message.content or ""
+        tokens_used = getattr(response.usage, "total_tokens", 0) or 0
+        return content.strip(), tokens_used
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Groq API error: {str(e)}")
 
 @app.get("/health")
 async def health():
@@ -100,25 +95,22 @@ Content:
 Provide only the suggested title, nothing else."""
 
     try:
-        summary_result = await call_grok_api(summary_prompt)
-        summary = summary_result["choices"][0]["message"]["content"].strip()
+        summary, summary_tokens = await call_groq_api(summary_prompt)
 
-        action_items_result = await call_grok_api(action_items_prompt)
-        action_items_text = action_items_result["choices"][0]["message"]["content"].strip()
+        action_items_text, action_items_tokens = await call_groq_api(
+            action_items_prompt
+        )
 
         try:
-            import json
             action_items = json.loads(action_items_text)
             if not isinstance(action_items, list):
                 action_items = [action_items_text]
         except:
             action_items = [action_items_text]
 
-        title_result = await call_grok_api(suggested_title_prompt)
-        suggested_title = title_result["choices"][0]["message"]["content"].strip()
+        suggested_title, title_tokens = await call_groq_api(suggested_title_prompt)
 
-        total_content = summary + action_items_text + suggested_title
-        tokens_used = len(total_content) // 4
+        tokens_used = summary_tokens + action_items_tokens + title_tokens
 
         return SummaryResponse(
             summary=summary,
